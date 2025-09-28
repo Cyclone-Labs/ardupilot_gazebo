@@ -1,5 +1,6 @@
 import numpy as np
 import math
+from scipy.optimize import least_squares
 
 # <air_density>: Density of the fluid this model is suspended in.
 # <area>: Surface area of the link.
@@ -184,33 +185,74 @@ def calculate_propeller_forces(
         total_force += blade_force
         total_torque += blade_torque
     
-    return {
-        'total_force': total_force,
-        'total_torque': total_torque,
-    }
+    return (
+        total_force[2],
+        total_torque[2]
+    )
 
+def run_motor_plant(throttle, voltage=22.2, motor_kv=2100):
+    return throttle * voltage * motor_kv
+
+def run_combined_plant(throttle, airfoil_params):
+    rpm = run_motor_plant(throttle)
+    omega = rpm * 2 * math.pi / 60.0
+    force, torque = calculate_propeller_forces(
+        num_blades=3,
+        air_density=1.2041,
+        blade_radius=airfoil_params[0],
+        area=airfoil_params[1],
+        a0 = airfoil_params[2],
+        cla = airfoil_params[3],
+        cda = airfoil_params[4],
+        cla_stall = airfoil_params[5],
+        alpha_stall= airfoil_params[6],
+        cda_stall = 0,
+        angular_velocity=omega,
+    )
+    amps = torque * omega / 22.2
+    return amps, force
 
 # Example usage
 if __name__ == "__main__":
-    # Example parameters for a 4-blade propeller
-    result = calculate_propeller_forces(
-        num_blades=4,                   # 4-blade propeller
-        blade_radius=0.5,               # m (50cm from hub to blade CP)
-        air_density=1.225,              # kg/m³ (sea level)
-        area=0.02,                      # m² (blade area, 200 cm²)
-        a0=math.radians(5),             # rad (5 degree built-in pitch angle)
-        cla=2*math.pi,                  # 1/rad (theoretical thin airfoil)
-        cda=0.01,                       # 1/rad (small drag slope)
-        alpha_stall=math.radians(15),   # rad (15 degree stall angle)
-        cla_stall=0.0,                  # 1/rad (no lift after stall)
-        cda_stall=1.0,                  # 1/rad (high drag after stall)
-        angular_velocity=100,           # rad/s (about 955 RPM)
-    )
-    
-    print("Propeller Forces:")
-    print(f"Total Force: {result['total_force']} N")
-    print(f"Total Torque: {result['total_torque']} N⋅m")
-    thrust_z = result['total_force'][2]  # Thrust is typically in Z direction
-    torque_z = result['total_torque'][2]  # Torque about Z axis
-    print(f"\nThrust (Z): {thrust_z:.2f} N")
-    print(f"Torque (Z): {torque_z:.3f} N⋅m")
+    data = np.array([ # (throttle, amps, grams thrust)
+        (0.1, 2.3, 181),
+        (0.2, 5.5, 393),
+        (0.3, 9.9, 576),
+        (0.4, 13.8, 576),
+        (0.5, 17.9, 885),
+        (0.6, 22.0, 1022),
+        (0.7, 25.0, 1136),
+        (0.8, 28.5, 1285),
+        (0.9, 36.1, 1513),
+        (1.0, 41.0, 1675)
+    ])
+    data[:,2] /= 1000.0 * 9.81 # convert grams to Newtons
+
+    params_initial = np.array([
+        0.03175, # 1.25 in to meters (blade center of pressure radius)
+        0.0008, #area
+        0.3, # a0
+        4.25, # cla
+        0.1, # cda
+        0.025, # cla_stall
+        1.4, # alpha_stall
+    ])
+
+    def residuals(params, data):
+        res = []
+        for row in data:
+            throttle, measured_amps, measured_thrust = row
+            predicted_amps, predicted_thrust = run_combined_plant(throttle, params)
+            res.append(predicted_amps - measured_amps)
+            res.append(predicted_thrust - measured_thrust)
+        return res
+
+    result = least_squares(residuals, params_initial, args=(data,), verbose=2,
+                           bounds=(
+                               (0.01, 0.0001, 0, 0, 0, 0, 0),
+                               (0.06, 0.002, 1, 10, 1, 0.1, np.pi/2)
+                           ))
+    print("Optimized parameters:", result.x)
+
+
+
