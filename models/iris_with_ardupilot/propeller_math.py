@@ -1,6 +1,7 @@
 import numpy as np
 import math
 from scipy.optimize import least_squares
+import torch
 
 # <air_density>: Density of the fluid this model is suspended in.
 # <area>: Surface area of the link.
@@ -192,7 +193,37 @@ def calculate_propeller_forces(
 
 import math
 
-def run_motor_plant(throttle, amperage, load_torque, voltage=22.2, motor_kv=2100, motor_resistance=0.056, internal_friction = 0.001, motor_kt=0.00455):
+class ResidualsNetwork(torch.nn.Module):
+    '''
+    MLP with input shape (3,) and output shape (1,)
+    2 hidden layers of 32 units each, ReLU activations
+    '''
+    def __init__(self):
+        self.hidden_1 = torch.nn.Linear(3, 32)
+        self.hidden_2 = torch.nn.Linear(32, 32)
+        self.output = torch.nn.Linear(32, 1)
+    
+    def predict(self, x):
+        # Simple linear model for demonstration
+        x = torch.relu(self.hidden_1(x))
+        x = torch.relu(self.hidden_2(x))
+        return self.output(x)
+    
+    def update_from_flattened(self, params):
+        # Update model parameters from a flattened array
+        current_index = 0
+        for param in self.parameters():
+            param_length = param.numel()
+            new_values = params[current_index:current_index + param_length].reshape(param.shape)
+            param.data = torch.tensor(new_values, dtype=param.dtype)
+            current_index += param_length
+
+net = ResidualsNetwork()
+total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+
+# TODO: use this in motor plant and jointly optimize NN params
+
+def run_motor_plant(throttle, amperage, load_torque, voltage=22.2, motor_kv=2100, motor_resistance=0.056, internal_friction = 0.001, motor_kt=0.00455, residual_parameters=np.zeros(22)):
     """
     Motor plant model including load torque dynamics
     
@@ -325,7 +356,7 @@ if __name__ == "__main__":
     print("Optimized parameters:", result.x)
     print("Optimized params scaled to bounds:", (result.x - bounds[0]) / (bounds[1] - bounds[0]))
     print("Final predicted values:", make_predictions(result.x, data))
-    print(result.jac[::2, 4])
+    print("Residuals: ", residuals(result.x, data))
     print("Final info:", result)
 
 
