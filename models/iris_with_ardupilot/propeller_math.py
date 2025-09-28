@@ -190,27 +190,78 @@ def calculate_propeller_forces(
         total_torque[2]
     )
 
-def run_motor_plant(throttle, voltage=22.2, motor_kv=2100):
-    return throttle * voltage * motor_kv
+import math
 
-def run_combined_plant(throttle, airfoil_params):
-    rpm = run_motor_plant(throttle)
-    omega = rpm * 2 * math.pi / 60.0
-    force, torque = calculate_propeller_forces(
-        num_blades=3,
-        air_density=1.2041,
-        blade_radius=airfoil_params[0],
-        area=airfoil_params[1],
-        a0 = airfoil_params[2],
-        cla = airfoil_params[3],
-        cda = airfoil_params[4],
-        cla_stall = airfoil_params[5],
-        alpha_stall= airfoil_params[6],
-        cda_stall = 0,
-        angular_velocity=omega,
-    )
-    amps = torque * omega / 22.2
-    return amps, force
+def run_motor_plant(throttle, amperage, load_torque, voltage=22.2, motor_kv=2100, motor_resistance=0.056, internal_friction = 0.001, motor_kt=0.00455):
+    """
+    Motor plant model including load torque dynamics
+    
+    throttle: [0,1] throttle input
+    amperage: motor current (A)
+    load_torque: external load torque (N⋅m)
+    voltage: supply voltage (V)
+    motor_kv: motor velocity constant (RPM/V)
+    motor_resistance: motor resistance (Ω)
+    motor_kt: motor torque constant (N⋅m/A) - if None, calculated from Kv
+    
+    Returns: angular velocity (rad/s)
+    """
+    applied_voltage = throttle * voltage
+    
+    # Calculate voltage drop across motor resistance
+    resistive_drop = amperage * motor_resistance
+    
+    # Back EMF is the remaining voltage after resistive drop
+    back_emf = applied_voltage - resistive_drop
+    
+    # Convert back EMF to no-load RPM using motor Kv
+    no_load_rpm = max(0, back_emf * motor_kv)
+    
+    # Motor torque from current
+    motor_torque = motor_kt * amperage
+    
+    # Simple approach: reduce RPM proportionally based on load
+    # More sophisticated models would solve the full electrical-mechanical coupling
+    
+    # Method 1: Linear torque-speed relationship
+    # Assume motor has some internal resistance to speed (like friction)
+    
+    # At steady state: motor_torque = load_torque + friction_torque
+    # friction_torque = internal_friction * omega
+    # So: omega = (motor_torque - load_torque) / internal_friction
+    
+    max_omega = no_load_rpm * 2 * math.pi / 60.0
+    
+    # Solve: motor_torque = load_torque + internal_friction * omega
+    omega = max(0, (motor_torque - load_torque) / internal_friction)
+    # Limit to no-load speed
+    omega = min(omega, max_omega)
+    
+    return omega
+
+def run_combined_plant(throttle, current, airfoil_params, no_load_current_constant):
+    def calc_prop(omega):
+        return calculate_propeller_forces(
+            num_blades=3,
+            air_density=1.2041,
+            blade_radius=airfoil_params[0],
+            area=airfoil_params[1],
+            a0 = airfoil_params[2],
+            cla = airfoil_params[3],
+            cda = airfoil_params[4],
+            cla_stall = airfoil_params[5],
+            alpha_stall= airfoil_params[6],
+            cda_stall = 0,
+            angular_velocity=omega,
+        )
+    def fn(x):
+        omega = run_motor_plant(throttle, current, x[0])
+        force, torque = calc_prop(omega)
+        return [torque - x[0]]
+    steady_state_load_torque = least_squares(fn, [0.01], bounds=(0, np.inf), ftol=1e-12, xtol=1e-12).x[0]
+    omega = run_motor_plant(throttle, current, steady_state_load_torque)
+    force, torque = calc_prop(omega)
+    return force
 
 # Example usage
 if __name__ == "__main__":
@@ -226,33 +277,56 @@ if __name__ == "__main__":
         (0.9, 36.1, 1513),
         (1.0, 41.0, 1675)
     ])
-    data[:,2] /= 1000.0 * 9.81 # convert grams to Newtons
+    data[:,2] = data[:,2] / 1000.0 * 9.81 # convert grams to Newtons
 
     params_initial = np.array([
         0.03175, # 1.25 in to meters (blade center of pressure radius)
         0.0008, #area
         0.3, # a0
         4.25, # cla
-        0.1, # cda
+        0.01, # cda
         0.025, # cla_stall
-        1.4, # alpha_stall
+        1.4, # alpha_stall,
+        1.4/10 # no load current per volt
     ])
 
-    def residuals(params, data):
+    def make_predictions(params, data):
         res = []
         for row in data:
             throttle, measured_amps, measured_thrust = row
-            predicted_amps, predicted_thrust = run_combined_plant(throttle, params)
-            res.append(predicted_amps - measured_amps)
-            res.append(predicted_thrust - measured_thrust)
+            predicted_thrust = run_combined_plant(throttle, measured_amps, params, params[7])
+            res.append(predicted_thrust)
+        return np.array(res)
+
+    def residuals(params, data):
+        res = []
+        predictions = make_predictions(params, data)
+        for i, row in enumerate(data):
+            throttle, measured_amps, measured_thrust = row
+            predicted_thrust = predictions[i]
+            res.append(predicted_thrust-measured_thrust)
         return res
 
-    result = least_squares(residuals, params_initial, args=(data,), verbose=2,
-                           bounds=(
-                               (0.01, 0.0001, 0, 0, 0, 0, 0),
-                               (0.06, 0.002, 1, 10, 1, 0.1, np.pi/2)
-                           ))
+    initial_values = make_predictions(params_initial, data)
+    print("Initial parameters:", params_initial)
+    print("Initial predicted values:", initial_values)
+    print("Actual values", data[:, 2])
+
+    bounds=np.array((
+        (0.01, 0.0001, 0, 0, 0, 0, 0, 0),
+        (0.06, 0.02, 1, 10, 0.2, 0.1, np.pi/2, 2.3)
+    ))
+    result = least_squares(residuals, params_initial, args=(data,), ftol=1e-12, xtol=1e-12,
+                        # bounds=(
+                        #      np.zeros(7),
+                        #      np.ones(7)*100),
+                        # )
+                           bounds=bounds)
     print("Optimized parameters:", result.x)
+    print("Optimized params scaled to bounds:", (result.x - bounds[0]) / (bounds[1] - bounds[0]))
+    print("Final predicted values:", make_predictions(result.x, data))
+    print(result.jac[::2, 4])
+    print("Final info:", result)
 
 
 
